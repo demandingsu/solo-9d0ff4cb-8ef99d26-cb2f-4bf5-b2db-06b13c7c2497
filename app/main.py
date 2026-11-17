@@ -14,11 +14,13 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from . import database as db
-from . import lineage
+from . import coverage, lineage
 from .schemas import (
     BatchRecord,
     BatchResponse,
     BatchSubmission,
+    CoverageRequest,
+    CoverageResponse,
     HealthResponse,
     ProductStatus,
     RevisionHistoryItem,
@@ -197,6 +199,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     summary=r["summary"],
                     parent_product_id=r["parent_product_id"],
                     parent_revision=r["parent_revision"],
+                    footprint=(
+                        None
+                        if r["footprint_left"] is None
+                        else {
+                            "left": r["footprint_left"],
+                            "top": r["footprint_top"],
+                            "right": r["footprint_right"],
+                            "bottom": r["footprint_bottom"],
+                        }
+                    ),
                     is_active=(r["revision"] == active_rev),
                     batch_id=r["batch_id"],
                     submitted_at=r["submitted_at"],
@@ -206,6 +218,24 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         return RevisionHistoryResponse(
             product_id=product_id, active_revision=active_rev, revisions=items
         )
+
+    # ---------------- 覆盖核验（缺口矩形） ----------------
+    @app.post(
+        "/api/coverage/gaps",
+        response_model=CoverageResponse,
+        tags=["覆盖核验"],
+        summary="核算目标画幅内的覆盖缺口（互不重叠缺口矩形、缺口面积与问题瓦片清单）",
+    )
+    def coverage_gaps(
+        payload: CoverageRequest,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> CoverageResponse:
+        target = payload.target.as_tuple()
+        tile_refs = [(t.product_id, t.revision) for t in payload.tiles]
+        # 修订状态与足迹必须来自同一个已提交快照：整次核验在单个只读事务内完成
+        with db.snapshot(conn):
+            result = coverage.verify_coverage(conn, target, tile_refs)
+        return CoverageResponse(**result)
 
     return app
 

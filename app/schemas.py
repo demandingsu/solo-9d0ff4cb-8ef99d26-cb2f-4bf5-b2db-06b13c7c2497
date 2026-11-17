@@ -21,6 +21,26 @@ BLOCKER_LABELS = {
 }
 
 
+class Footprint(BaseModel):
+    """整数像素足迹矩形（左上、右下，右下边界不含）。"""
+
+    left: int = Field(..., description="左边界像素坐标（含）")
+    top: int = Field(..., description="上边界像素坐标（含）")
+    right: int = Field(..., description="右边界像素坐标（不含），必须严格大于 left")
+    bottom: int = Field(..., description="下边界像素坐标（不含），必须严格大于 top")
+
+    @model_validator(mode="after")
+    def _check_positive_extent(self) -> "Footprint":
+        if self.right <= self.left:
+            raise ValueError("足迹 right 必须严格大于 left（右下边界不含）")
+        if self.bottom <= self.top:
+            raise ValueError("足迹 bottom 必须严格大于 top（右下边界不含）")
+        return self
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        return self.left, self.top, self.right, self.bottom
+
+
 class ManifestItem(BaseModel):
     """清单中的单个条目：原始瓦片或一级/多级拼图。"""
 
@@ -32,6 +52,13 @@ class ManifestItem(BaseModel):
     )
     parent_revision: Optional[int] = Field(
         default=None, ge=1, description="固定引用的父修订号；原始瓦片留空，拼图必填"
+    )
+    footprint: Optional[Footprint] = Field(
+        default=None,
+        description=(
+            "可选的整数像素足迹（left/top/right/bottom，右下边界不含）；"
+            "旧清单不带足迹仍可提交与追溯"
+        ),
     )
 
     @model_validator(mode="after")
@@ -111,6 +138,9 @@ class RevisionHistoryItem(BaseModel):
     summary: str
     parent_product_id: Optional[str]
     parent_revision: Optional[int]
+    footprint: Optional[Footprint] = Field(
+        default=None, description="提交时登记的像素足迹；旧清单无足迹时为 null"
+    )
     is_active: bool
     batch_id: int
     submitted_at: str
@@ -136,3 +166,90 @@ class BatchRecord(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok"]
     database: str
+
+
+# ---------------------------------------------------------------------------
+# 覆盖核验（缺口矩形）
+# ---------------------------------------------------------------------------
+
+class CoverageTileRef(BaseModel):
+    """核验请求中指定的一个成果号 + 修订号。"""
+
+    product_id: str = Field(..., min_length=1, description="成果号，如 R-100")
+    revision: int = Field(..., ge=1, description="指定的修订号")
+
+
+class CoverageRequest(BaseModel):
+    """覆盖核验请求：目标矩形 + 至多 64 个指定瓦片。"""
+
+    target: Footprint = Field(..., description="目标画幅矩形（像素坐标，右下边界不含）")
+    tiles: list[CoverageTileRef] = Field(
+        default_factory=list,
+        max_length=64,
+        description="至多 64 个指定（成果号, 修订号）瓦片；重复指定按一个处理",
+    )
+
+
+class GapRect(BaseModel):
+    """目标内的一个缺口矩形（互不重叠）。"""
+
+    left: int
+    top: int
+    right: int
+    bottom: int
+    area: int = Field(..., description="缺口面积（像素数，等于 (right-left)*(bottom-top)）")
+
+
+class CoverageTileIssue(BaseModel):
+    """未实际贡献覆盖的指定瓦片及其原因。"""
+
+    product_id: str
+    revision: int
+    reason: Literal["missing", "superseded", "no_footprint"] = Field(
+        ...,
+        description=(
+            "missing=成果或修订从未提交；superseded=该修订已非现役（同成果号有更高修订）；"
+            "no_footprint=现役有效但提交清单未带足迹"
+        ),
+    )
+    detail: str = Field(..., description="问题的具体说明")
+
+
+class CoverageContributingTile(BaseModel):
+    """实际贡献覆盖的指定瓦片（足迹已按目标矩形裁剪）。"""
+
+    product_id: str
+    revision: int
+    footprint: Footprint = Field(..., description="库内登记的原始足迹")
+    clipped_footprint: Optional[Footprint] = Field(
+        ..., description="与目标矩形求交后的实际覆盖矩形；足迹完全在目标外时为 null"
+    )
+    applied_area: int = Field(
+        ..., description="目标内实际覆盖面积（裁剪后，不含与其他瓦片重叠的重复计数由缺口算法处理）"
+    )
+    is_active: bool = Field(..., description="该修订是否为其成果号下的现役修订（参与覆盖者恒为 true）")
+
+
+class CoverageResponse(BaseModel):
+    """覆盖核验结果。"""
+
+    target: Footprint
+    target_area: int = Field(..., description="目标矩形总面积（像素数）")
+    covered_area: int = Field(..., description="目标内被覆盖的总面积（重叠不重复计数）")
+    gap_area: int = Field(..., description="目标内缺口总面积（像素数），满足 target_area=covered_area+gap_area")
+    gaps: list[GapRect] = Field(
+        default_factory=list,
+        description="目标内互不重叠的缺口矩形（坐标按 top、left 排序）；完全覆盖时为空",
+    )
+    contributing_tiles: list[CoverageContributingTile] = Field(
+        default_factory=list, description="实际贡献覆盖的瓦片（现役且带足迹）"
+    )
+    missing_tiles: list[CoverageTileIssue] = Field(
+        default_factory=list, description="成果或修订从未提交的指定瓦片"
+    )
+    superseded_tiles: list[CoverageTileIssue] = Field(
+        default_factory=list, description="已非现役修订的指定瓦片（新修订提交后旧修订不再贡献覆盖）"
+    )
+    no_footprint_tiles: list[CoverageTileIssue] = Field(
+        default_factory=list, description="现役有效但清单未带足迹的指定瓦片"
+    )

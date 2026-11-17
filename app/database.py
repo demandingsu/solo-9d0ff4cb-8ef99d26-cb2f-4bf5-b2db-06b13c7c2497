@@ -40,6 +40,10 @@ CREATE TABLE IF NOT EXISTS revisions (
     summary            TEXT NOT NULL,
     parent_product_id  TEXT,
     parent_revision    INTEGER,
+    footprint_left     INTEGER,
+    footprint_top      INTEGER,
+    footprint_right    INTEGER,
+    footprint_bottom   INTEGER,
     batch_id           INTEGER NOT NULL REFERENCES batches(batch_id),
     submitted_at       TEXT NOT NULL,
     PRIMARY KEY (product_id, revision)
@@ -48,6 +52,14 @@ CREATE TABLE IF NOT EXISTS revisions (
 CREATE INDEX IF NOT EXISTS idx_revisions_parent
     ON revisions(parent_product_id, parent_revision);
 """
+
+# 旧库（无足迹列）的增量迁移：四个可空列，旧清单保持 NULL，仍可提交与追溯。
+_MIGRATION_COLUMNS = (
+    ("footprint_left", "INTEGER"),
+    ("footprint_top", "INTEGER"),
+    ("footprint_right", "INTEGER"),
+    ("footprint_bottom", "INTEGER"),
+)
 
 
 def utc_now_iso() -> str:
@@ -83,6 +95,18 @@ def _ensure_wal(conn: sqlite3.Connection, db_path: str) -> None:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
+    _migrate_footprint_columns(conn)
+
+
+def _migrate_footprint_columns(conn: sqlite3.Connection) -> None:
+    """为建表时还没有足迹列的旧库补齐四个可空列（幂等）。"""
+    existing = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(revisions)")
+    }
+    for column, decl in _MIGRATION_COLUMNS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE revisions ADD COLUMN {column} {decl}")
 
 
 @contextmanager
@@ -266,13 +290,20 @@ def submit_batch(conn: sqlite3.Connection, items: list[dict[str, Any]]) -> dict[
         for key, item in deduped.items():
             if key in identical_existing:
                 continue
+            fp = item["footprint"]
             conn.execute(
                 "INSERT INTO revisions (product_id, revision, summary, "
-                "parent_product_id, parent_revision, batch_id, submitted_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "parent_product_id, parent_revision, "
+                "footprint_left, footprint_top, footprint_right, footprint_bottom, "
+                "batch_id, submitted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item["product_id"], item["revision"], item["summary"],
                     item["parent_product_id"], item["parent_revision"],
+                    None if fp is None else fp["left"],
+                    None if fp is None else fp["top"],
+                    None if fp is None else fp["right"],
+                    None if fp is None else fp["bottom"],
                     batch_id, now,
                 ),
             )
@@ -304,16 +335,37 @@ def _record_rejected(
         raise
 
 
+def _footprint_key(item: dict[str, Any]) -> Optional[tuple[Any, ...]]:
+    """把足迹归一为可比较的四元组；无足迹为 None。"""
+    fp = item.get("footprint")
+    if fp is None:
+        return None
+    return (fp["left"], fp["top"], fp["right"], fp["bottom"])
+
+
 def _content_differs(a: dict[str, Any], b: dict[str, Any]) -> bool:
     fields = ("summary", "parent_product_id", "parent_revision")
-    return any(a[f] != b[f] for f in fields)
+    if any(a[f] != b[f] for f in fields):
+        return True
+    # 同号同修订若足迹不同，同样按清单内容不一致处理（整批拒收）
+    return _footprint_key(a) != _footprint_key(b)
 
 
 def _row_to_item(row: sqlite3.Row) -> dict[str, Any]:
+    if row["footprint_left"] is None:
+        footprint = None
+    else:
+        footprint = {
+            "left": row["footprint_left"],
+            "top": row["footprint_top"],
+            "right": row["footprint_right"],
+            "bottom": row["footprint_bottom"],
+        }
     return {
         "product_id": row["product_id"],
         "revision": row["revision"],
         "summary": row["summary"],
         "parent_product_id": row["parent_product_id"],
         "parent_revision": row["parent_revision"],
+        "footprint": footprint,
     }

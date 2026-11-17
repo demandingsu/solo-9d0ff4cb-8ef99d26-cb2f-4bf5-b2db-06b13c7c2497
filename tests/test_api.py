@@ -354,9 +354,11 @@ def test_concurrent_conflicting_writes_serialize():
     t1.start(); t2.start(); t1.join(); t2.join()
 
     assert sorted(o[1] for o in outcomes) == ["accepted", "rejected"]
+    # 两个线程谁先拿到写锁不确定，存活摘要必须与 accepted 的那一方一致
+    winner_summary = next(summary for summary, status, _ in outcomes if status == "accepted")
     with TestClient(app) as c:
         surviving = c.get("/api/products/X/status").json()
-        assert surviving["summary"] == "摘要A"
+        assert surviving["summary"] == winner_summary
         statuses = [b["status"] for b in c.get("/api/batches").json()]
         assert sorted(statuses) == ["accepted", "rejected"]
     for suffix in ("", "-wal", "-shm"):
